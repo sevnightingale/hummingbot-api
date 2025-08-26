@@ -6,11 +6,11 @@ from typing import Dict, List, Optional
 
 from fastapi import HTTPException
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
-from hummingbot.core.data_type.common import OrderType, TradeType, PositionAction, PositionMode
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 from config import settings
-from database import AsyncDatabaseManager, AccountRepository, OrderRepository, TradeRepository, FundingRepository
+from database import AccountRepository, AsyncDatabaseManager, FundingRepository, OrderRepository, TradeRepository
 from services.market_data_feed_manager import MarketDataFeedManager
 from utils.connector_manager import ConnectorManager
 from utils.file_system import fs_util
@@ -795,43 +795,117 @@ class AccountsService:
         if account_name not in self.list_accounts():
             raise HTTPException(status_code=404, detail=f"Account '{account_name}' not found")
         
-        # Validate connector exists for account
-        if not self.connector_manager.is_connector_initialized(account_name, connector_name):
-            raise HTTPException(status_code=404, detail=f"Connector '{connector_name}' not found for account '{account_name}'")
+        # Validate connector is available in AllConnectorSettings
+        from hummingbot.client.settings import AllConnectorSettings
+        available_connectors = list(AllConnectorSettings.get_connector_settings().keys())
+        if connector_name not in available_connectors:
+            raise HTTPException(status_code=404, detail=f"Connector '{connector_name}' is not available. Available connectors: {available_connectors[:10]}...")
         
-        # Get the connector instance
-        connector = await self.connector_manager.get_connector(account_name, connector_name)
+        # Get the connector instance (this will create it if it doesn't exist)
+        try:
+            connector = await self.connector_manager.get_connector(account_name, connector_name)
+        except Exception as e:
+            import traceback
+            error_details = f"Exception: {type(e).__name__}: {str(e)}\nTraceback: {traceback.format_exc()}"
+            logger.error(f"Failed to initialize connector {connector_name} for account {account_name}: {error_details}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize connector '{connector_name}' for account '{account_name}': {type(e).__name__}: {str(e)}")
         
         # Validate price for limit orders
         if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER] and price is None:
             raise HTTPException(status_code=400, detail="Price is required for LIMIT and LIMIT_MAKER orders")
         
-        # Check if trading rules are loaded
-        if not connector.trading_rules:
-            raise HTTPException(
-                status_code=503, 
-                detail=f"Trading rules not yet loaded for {connector_name}. Please try again in a moment."
-            )
+        # Get trading rules (handle both regular and paper trading connectors)
+        if connector_name.endswith("_paper_trade"):
+            # Paper trading connectors use the underlying exchange's trading rules
+            base_exchange_name = connector_name.replace("_paper_trade", "")
+            logger.debug(f"Getting trading rules from base exchange {base_exchange_name} for paper trading connector {connector_name}")
+            
+            if market_data_manager:
+                # Get trading rules from the market data manager which can handle both regular and paper trading
+                try:
+                    trading_rules_data = await market_data_manager.get_trading_rules(base_exchange_name, [trading_pair])
+                    if trading_pair not in trading_rules_data or "error" in trading_rules_data.get(trading_pair, {}):
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"Trading pair '{trading_pair}' not available for paper trading on {base_exchange_name}"
+                        )
+                    
+                    # Create a mock trading rule object for validation
+                    rule_data = trading_rules_data[trading_pair]
+                    from types import SimpleNamespace
+                    trading_rule = SimpleNamespace(
+                        min_order_size=Decimal(str(rule_data.get("min_order_size", "0.001"))),
+                        max_order_size=Decimal(str(rule_data.get("max_order_size", "1000000"))) if rule_data.get("max_order_size") else None,
+                        min_notional_size=Decimal(str(rule_data.get("min_notional_size", "10"))),
+                        min_price_increment=Decimal(str(rule_data.get("min_price_increment", "0.01"))),
+                        min_base_amount_increment=Decimal(str(rule_data.get("min_base_amount_increment", "0.001")))
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to get trading rules for paper trading: {e}")
+                    # Create minimal default trading rule for paper trading
+                    from types import SimpleNamespace
+                    trading_rule = SimpleNamespace(
+                        min_order_size=Decimal("0.001"),
+                        max_order_size=None,
+                        min_notional_size=Decimal("10"),
+                        min_price_increment=Decimal("0.01"),
+                        min_base_amount_increment=Decimal("0.001")
+                    )
+            else:
+                # No market data manager - use default rules for paper trading
+                from types import SimpleNamespace
+                trading_rule = SimpleNamespace(
+                    min_order_size=Decimal("0.001"),
+                    max_order_size=None,
+                    min_notional_size=Decimal("10"),
+                    min_price_increment=Decimal("0.01"),
+                    min_base_amount_increment=Decimal("0.001")
+                )
+        else:
+            # Regular connector - validate trading rules
+            if not hasattr(connector, 'trading_rules') or not connector.trading_rules:
+                raise HTTPException(
+                    status_code=503, 
+                    detail=f"Trading rules not yet loaded for {connector_name}. Please try again in a moment."
+                )
+            
+            # Validate trading pair and get trading rule
+            if trading_pair not in connector.trading_rules:
+                available_pairs = list(connector.trading_rules.keys())[:10]  # Show first 10
+                more_text = f" (and {len(connector.trading_rules) - 10} more)" if len(connector.trading_rules) > 10 else ""
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Trading pair '{trading_pair}' not supported on {connector_name}. "
+                           f"Available pairs: {available_pairs}{more_text}"
+                )
+            
+            trading_rule = connector.trading_rules[trading_pair]
         
-        # Validate trading pair and get trading rule
-        if trading_pair not in connector.trading_rules:
-            available_pairs = list(connector.trading_rules.keys())[:10]  # Show first 10
-            more_text = f" (and {len(connector.trading_rules) - 10} more)" if len(connector.trading_rules) > 10 else ""
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Trading pair '{trading_pair}' not supported on {connector_name}. "
-                       f"Available pairs: {available_pairs}{more_text}"
-            )
+        # Validate order type is supported (with paper trading fallback)
+        try:
+            if order_type not in connector.supported_order_types():
+                supported_types = [ot.name for ot in connector.supported_order_types()]
+                raise HTTPException(status_code=400, detail=f"Order type '{order_type.name}' not supported. Supported types: {supported_types}")
+        except Exception as e:
+            # Paper trading connectors might not implement supported_order_types properly
+            if connector_name.endswith("_paper_trade"):
+                logger.debug(f"Paper trading connector {connector_name} does not support order type validation: {e}")
+                # Allow common order types for paper trading
+                if order_type not in [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+                    raise HTTPException(status_code=400, detail=f"Order type '{order_type.name}' not supported for paper trading")
+            else:
+                raise HTTPException(status_code=500, detail=f"Error checking supported order types: {str(e)}")
         
-        trading_rule = connector.trading_rules[trading_pair]
-        
-        # Validate order type is supported
-        if order_type not in connector.supported_order_types():
-            supported_types = [ot.name for ot in connector.supported_order_types()]
-            raise HTTPException(status_code=400, detail=f"Order type '{order_type.name}' not supported. Supported types: {supported_types}")
-        
-        # Quantize amount according to trading rules
-        quantized_amount = connector.quantize_order_amount(trading_pair, amount)
+        # Quantize amount according to trading rules (with paper trading fallback)
+        try:
+            quantized_amount = connector.quantize_order_amount(trading_pair, amount)
+        except Exception as e:
+            if connector_name.endswith("_paper_trade"):
+                logger.debug(f"Paper trading connector {connector_name} quantization fallback: {e}")
+                # Use simple quantization for paper trading based on trading rule
+                quantized_amount = amount.quantize(trading_rule.min_base_amount_increment)
+            else:
+                raise HTTPException(status_code=500, detail=f"Error quantizing order amount: {str(e)}")
         
         # Validate minimum order size
         if quantized_amount < trading_rule.min_order_size:
@@ -842,13 +916,25 @@ class AccountsService:
         
         # Calculate and validate notional size
         if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
-            quantized_price = connector.quantize_order_price(trading_pair, price)
+            # Quantize price according to trading rules (with paper trading fallback)
+            try:
+                quantized_price = connector.quantize_order_price(trading_pair, price)
+            except Exception as e:
+                if connector_name.endswith("_paper_trade"):
+                    logger.debug(f"Paper trading connector {connector_name} price quantization fallback: {e}")
+                    # Use simple quantization for paper trading based on trading rule
+                    quantized_price = price.quantize(trading_rule.min_price_increment)
+                else:
+                    raise HTTPException(status_code=500, detail=f"Error quantizing order price: {str(e)}")
+            
             notional_size = quantized_price * quantized_amount
         else:
             # For market orders without price, get current market price for validation
             if market_data_manager:
                 try:
-                    prices = await market_data_manager.get_prices(connector_name, [trading_pair])
+                    # For paper trading, use base exchange name for price fetching
+                    price_connector_name = connector_name.replace("_paper_trade", "") if connector_name.endswith("_paper_trade") else connector_name
+                    prices = await market_data_manager.get_prices(price_connector_name, [trading_pair])
                     if trading_pair in prices and "error" not in prices:
                         price = Decimal(str(prices[trading_pair]))
                 except Exception as e:

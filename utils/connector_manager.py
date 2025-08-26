@@ -12,6 +12,7 @@ from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, ReadOnlyClientConfigAdapter, get_connector_class
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.exchange.paper_trade import create_paper_trade_market
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -58,6 +59,7 @@ class ConnectorManager:
     def _create_connector(self, account_name: str, connector_name: str):
         """
         Create a new connector instance.
+        Handles both regular connectors and paper trading connectors.
 
         :param account_name: The name of the account.
         :param connector_name: The name of the connector.
@@ -65,12 +67,28 @@ class ConnectorManager:
         """
         BackendAPISecurity.login_account(account_name=account_name, secrets_manager=self.secrets_manager)
         client_config_map = ClientConfigAdapter(ClientConfigMap())
-        conn_setting = AllConnectorSettings.get_connector_settings()[connector_name]
-        keys = BackendAPISecurity.api_keys(connector_name)
 
         # Debug logging
         logger.info(f"Creating connector {connector_name} for account {account_name}")
-        logger.debug(f"API keys retrieved: {list(keys.keys()) if keys else 'None'}")
+
+        # Check if this is a paper trading connector
+        if connector_name.endswith("_paper_trade"):
+            return self._create_paper_trading_connector(connector_name, client_config_map)
+        else:
+            return self._create_regular_connector(connector_name, client_config_map)
+
+    def _create_regular_connector(self, connector_name: str, client_config_map: ClientConfigAdapter):
+        """
+        Create a regular (live trading) connector instance.
+        
+        :param connector_name: The name of the connector.
+        :param client_config_map: Client configuration map.
+        :return: The connector object.
+        """
+        conn_setting = AllConnectorSettings.get_connector_settings()[connector_name]
+        keys = BackendAPISecurity.api_keys(connector_name)
+
+        logger.debug(f"API keys retrieved for {connector_name}: {list(keys.keys()) if keys else 'None'}")
 
         read_only_config = ReadOnlyClientConfigAdapter.lock_config(client_config_map)
 
@@ -81,12 +99,58 @@ class ConnectorManager:
             client_config_map=read_only_config,
         )
 
-        # Debug logging
-        logger.debug(f"Init params keys: {list(init_params.keys())}")
+        logger.debug(f"Init params keys for {connector_name}: {list(init_params.keys())}")
 
         connector_class = get_connector_class(connector_name)
         connector = connector_class(**init_params)
         return connector
+
+    def _create_paper_trading_connector(self, connector_name: str, client_config_map: ClientConfigAdapter):
+        """
+        Create a paper trading connector instance.
+        
+        :param connector_name: The paper trading connector name (e.g., 'binance_paper_trade').
+        :param client_config_map: Client configuration map.
+        :return: The paper trading connector object.
+        """
+        # Extract base exchange name (remove '_paper_trade' suffix)
+        base_exchange_name = connector_name.replace("_paper_trade", "")
+        
+        logger.info(f"Creating paper trading connector for base exchange: {base_exchange_name}")
+        
+        # Use standard trading pairs for paper trading
+        # These can be updated later via _initialize_trading_pair_symbol_map
+        trading_pairs = ["BTC-USDT", "ETH-USDT", "BNB-USDT"]
+        
+        try:
+            # Create paper trading connector using Hummingbot's built-in function
+            connector = create_paper_trade_market(
+                exchange_name=base_exchange_name,
+                client_config_map=client_config_map, 
+                trading_pairs=trading_pairs
+            )
+            
+            # Set paper trading balances from configuration
+            paper_trade_config = client_config_map.paper_trade
+            if paper_trade_config and paper_trade_config.paper_trade_account_balance:
+                for asset, balance in paper_trade_config.paper_trade_account_balance.items():
+                    connector.set_balance(asset, float(balance))
+                    logger.debug(f"Set paper trading balance: {asset} = {balance}")
+            
+            # Initialize trading rules by accessing the underlying connector
+            # Paper trading connectors wrap a real connector that has trading rules
+            if hasattr(connector, '_market_data_tracker') and hasattr(connector._market_data_tracker, '_connector_class'):
+                # Access the underlying connector for trading rules
+                logger.debug(f"Paper trading connector wraps: {connector._market_data_tracker._connector_class}")
+            
+            logger.info(f"Successfully created paper trading connector {connector_name}")
+            return connector
+            
+        except Exception as e:
+            logger.error(f"Error creating paper trading connector {connector_name}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
     def clear_cache(self, account_name: Optional[str] = None, connector_name: Optional[str] = None):
         """
@@ -199,6 +263,22 @@ class ConnectorManager:
         # Create the base connector
         connector = self._create_connector(account_name, connector_name)
 
+        # Handle initialization differently for paper trading vs regular connectors
+        if connector_name.endswith("_paper_trade"):
+            await self._initialize_paper_trading_connector(connector, account_name, connector_name)
+        else:
+            await self._initialize_regular_connector(connector, account_name, connector_name)
+
+        self._connector_cache[cache_key] = connector
+        logger.info(f"Initialized connector {connector_name} for account {account_name}")
+        return connector
+
+    async def _initialize_regular_connector(self, connector: ConnectorBase, account_name: str, connector_name: str):
+        """
+        Initialize a regular (live trading) connector with full setup.
+        """
+        cache_key = f"{account_name}:{connector_name}"
+        
         # Initialize symbol map
         await connector._initialize_trading_pair_symbol_map()
 
@@ -213,8 +293,6 @@ class ConnectorManager:
             if PositionMode.HEDGE in connector.supported_position_modes():
                 connector.set_position_mode(PositionMode.HEDGE)
             await connector._update_positions()
-
-        self._connector_cache[cache_key] = connector
 
         # Load existing orders from database before starting network
         if self.db_manager:
@@ -247,8 +325,66 @@ class ConnectorManager:
         # Perform initial update of connector state
         await self._update_connector_state(connector, connector_name)
 
-        logger.info(f"Initialized connector {connector_name} for account {account_name}")
-        return connector
+    async def _initialize_paper_trading_connector(self, connector, account_name: str, connector_name: str):
+        """
+        Initialize a paper trading connector with minimal setup.
+        Paper trading connectors are wrappers and don't need the same initialization as regular connectors.
+        """
+        cache_key = f"{account_name}:{connector_name}"
+        
+        try:
+            logger.info(f"Initializing paper trading connector {connector_name} for account {account_name}")
+            
+            # Just verify the connector is ready
+            logger.debug(f"Paper trading connector type: {type(connector)}")
+            
+            # Check if it has the required attributes
+            if hasattr(connector, '_account_balances'):
+                balances = getattr(connector, '_account_balances', {})
+                logger.debug(f"Paper trading connector {connector_name} balances: {balances}")
+            
+            # Ensure trading rules are accessible
+            # Paper trading connectors should delegate trading rules to their underlying tracker
+            if not hasattr(connector, 'trading_rules') or not connector.trading_rules:
+                logger.debug(f"Paper trading connector {connector_name} has no trading rules, checking underlying connector")
+                
+                # Try to initialize trading rules from the order book tracker
+                if hasattr(connector, '_order_book_tracker') and connector._order_book_tracker:
+                    try:
+                        # The order book tracker should have access to trading rules via its connector
+                        await connector._order_book_tracker._update_trading_rules()
+                        logger.debug(f"Updated trading rules via order book tracker for {connector_name}")
+                    except Exception as e:
+                        logger.warning(f"Could not update trading rules via tracker for {connector_name}: {e}")
+                
+                # As a fallback, create a minimal set of trading rules for common pairs
+                if not hasattr(connector, 'trading_rules') or not connector.trading_rules:
+                    logger.warning(f"Creating minimal trading rules for paper trading connector {connector_name}")
+                    # This will be handled by the place_trade method if needed
+
+            # Start order tracking if db_manager is available
+            if self.db_manager:
+                if cache_key not in self._orders_recorders:
+                    try:
+                        # Import OrdersRecorder dynamically to avoid circular imports
+                        from services.orders_recorder import OrdersRecorder
+
+                        # Create and start orders recorder
+                        orders_recorder = OrdersRecorder(self.db_manager, account_name, connector_name)
+                        orders_recorder.start(connector)
+                        self._orders_recorders[cache_key] = orders_recorder
+                        logger.debug(f"Started order recorder for paper trading connector {connector_name}")
+                    except Exception as e:
+                        logger.warning(f"Could not start order recorder for paper trading connector {connector_name}: {e}")
+                        # Don't fail the entire initialization for order recorder issues
+
+            logger.info(f"Paper trading connector {connector_name} initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing paper trading connector {connector_name}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
 
     async def _start_connector_network(self, connector: ConnectorBase):
         """

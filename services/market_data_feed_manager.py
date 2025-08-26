@@ -1,8 +1,8 @@
 import asyncio
-import time
-from typing import Dict, Optional, Callable, List
 import logging
+import time
 from enum import Enum
+from typing import Callable, Dict, List, Optional
 
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -183,7 +183,11 @@ class MarketDataFeedManager:
             Dictionary mapping trading pairs to their trading rules
         """
         try:
-            # Access connector through MarketDataProvider's _rate_sources LazyDict
+            # Handle paper trading connectors differently
+            if connector_name.endswith("_paper_trade"):
+                return await self._get_paper_trading_rules(connector_name, trading_pairs)
+            
+            # Access regular connector through MarketDataProvider's _rate_sources LazyDict
             connector = self.market_data_provider._rate_sources[connector_name]
             
             # Check if trading rules are initialized, if not update them
@@ -599,3 +603,77 @@ class MarketDataFeedManager:
                 self.logger.warning(f"No cleanup function for feed type: {feed_type}")
         else:
             self.logger.warning(f"Feed not found for cleanup: {feed_key}")
+    
+    async def _get_paper_trading_rules(self, connector_name: str, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict]:
+        """
+        Get trading rules for paper trading connectors.
+        Paper trading connectors use the underlying exchange's trading rules.
+        
+        Args:
+            connector_name: Paper trading connector name (e.g., 'binance_paper_trade')
+            trading_pairs: List of trading pairs to get rules for
+            
+        Returns:
+            Dictionary mapping trading pairs to their trading rules
+        """
+        try:
+            # Extract base exchange name (remove '_paper_trade' suffix)
+            base_exchange_name = connector_name.replace("_paper_trade", "")
+            
+            self.logger.debug(f"Getting trading rules for paper trading connector {connector_name} using base exchange {base_exchange_name}")
+            
+            # Use the base exchange connector to get trading rules
+            base_connector = self.market_data_provider._rate_sources[base_exchange_name]
+            
+            # Check if trading rules are initialized, if not update them
+            if not base_connector.trading_rules or len(base_connector.trading_rules) == 0:
+                await base_connector._update_trading_rules()
+            
+            # Get trading rules from base connector
+            if trading_pairs:
+                # Get rules for specific trading pairs
+                result = {}
+                for trading_pair in trading_pairs:
+                    if trading_pair in base_connector.trading_rules:
+                        rule = base_connector.trading_rules[trading_pair]
+                        result[trading_pair] = {
+                            "min_order_size": float(rule.min_order_size),
+                            "max_order_size": float(rule.max_order_size) if rule.max_order_size else None,
+                            "min_price_increment": float(rule.min_price_increment),
+                            "min_base_amount_increment": float(rule.min_base_amount_increment),
+                            "min_quote_amount_increment": float(rule.min_quote_amount_increment),
+                            "min_notional_size": float(rule.min_notional_size),
+                            "min_order_value": float(rule.min_order_value),
+                            "max_price_significant_digits": float(rule.max_price_significant_digits),
+                            "supports_limit_orders": rule.supports_limit_orders,
+                            "supports_market_orders": rule.supports_market_orders,
+                            "buy_order_collateral_token": rule.buy_order_collateral_token,
+                            "sell_order_collateral_token": rule.sell_order_collateral_token,
+                        }
+                    else:
+                        result[trading_pair] = {"error": f"Trading pair {trading_pair} not found"}
+            else:
+                # Get all trading rules
+                result = {}
+                for trading_pair, rule in base_connector.trading_rules.items():
+                    result[trading_pair] = {
+                        "min_order_size": float(rule.min_order_size),
+                        "max_order_size": float(rule.max_order_size) if rule.max_order_size else None,
+                        "min_price_increment": float(rule.min_price_increment),
+                        "min_base_amount_increment": float(rule.min_base_amount_increment),
+                        "min_quote_amount_increment": float(rule.min_quote_amount_increment),
+                        "min_notional_size": float(rule.min_notional_size),
+                        "min_order_value": float(rule.min_order_value),
+                        "max_price_significant_digits": float(rule.max_price_significant_digits),
+                        "supports_limit_orders": rule.supports_limit_orders,
+                        "supports_market_orders": rule.supports_market_orders,
+                        "buy_order_collateral_token": rule.buy_order_collateral_token,
+                        "sell_order_collateral_token": rule.sell_order_collateral_token,
+                    }
+            
+            self.logger.debug(f"Retrieved {len(result)} trading rules for paper trading connector {connector_name}")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error getting paper trading rules for {connector_name}: {e}")
+            return {"error": str(e)}

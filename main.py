@@ -1,9 +1,9 @@
+import logging
 import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated
 
 import logfire
-import logging
 from dotenv import load_dotenv
 
 # Load environment variables early
@@ -21,22 +21,19 @@ def patched_save_to_yml(yml_path, cm):
 
 # Apply the patch before importing hummingbot components
 from hummingbot.client.config import config_helpers
+
 config_helpers.save_to_yml = patched_save_to_yml
 
-from hummingbot.core.rate_oracle.rate_oracle import RateOracle
-
 from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from hummingbot.data_feed.market_data_provider import MarketDataProvider
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
+from hummingbot.client.settings import AllConnectorSettings
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.data_feed.market_data_provider import MarketDataProvider
 
-from utils.security import BackendAPISecurity
-from services.bots_orchestrator import BotsOrchestrator
-from services.accounts_service import AccountsService
-from services.docker_service import DockerService
-from services.market_data_feed_manager import MarketDataFeedManager
-from utils.bot_archiver import BotArchiver
+from config import settings
 from routers import (
     accounts,
     archived_bots,
@@ -48,11 +45,14 @@ from routers import (
     market_data,
     portfolio,
     scripts,
-    trading
+    trading,
 )
-
-from config import settings
-
+from services.accounts_service import AccountsService
+from services.bots_orchestrator import BotsOrchestrator
+from services.docker_service import DockerService
+from services.market_data_feed_manager import MarketDataFeedManager
+from utils.bot_archiver import BotArchiver
+from utils.security import BackendAPISecurity
 
 # Set up logging configuration
 logging.basicConfig(
@@ -96,6 +96,18 @@ async def lifespan(app: FastAPI):
         cleanup_interval=settings.market_data.cleanup_interval,
         feed_timeout=settings.market_data.feed_timeout
     )
+
+    # Initialize paper trading connectors
+    try:
+        client_config = ClientConfigMap()
+        paper_exchanges = client_config.paper_trade.paper_trade_exchanges
+        if paper_exchanges:
+            AllConnectorSettings.initialize_paper_trade_settings(paper_exchanges)
+            logging.info(f"Initialized paper trading for exchanges: {paper_exchanges}")
+        else:
+            logging.info("No paper trading exchanges configured")
+    except Exception as e:
+        logging.error(f"Failed to initialize paper trading: {e}")
 
     # Initialize services
     bots_orchestrator = BotsOrchestrator(
